@@ -38,6 +38,7 @@ interface AppState {
   replyTo: AppMessage | null
   roomMessages: Record<string, AppMessage[]>   // pre-loaded per-room cache
   syncingPlatform: string | null               // platform currently syncing after connect
+  bridgeConnections: Record<string, boolean>   // explicit connection state, source of truth for UI
 
   // Actions
   login: (homeserver: string, username: string, password: string) => Promise<void>
@@ -55,6 +56,7 @@ interface AppState {
   removeFromGroup: (groupId: string, roomId: string) => Promise<void>
   appendMessage: (msg: AppMessage) => void
   syncPlatformMessages: (platformId: string) => Promise<void>
+  setBridgeConnected: (platformId: string, connected: boolean) => void
 }
 
 export const useStore = create<AppState>()(
@@ -75,6 +77,7 @@ export const useStore = create<AppState>()(
       replyTo: null,
       roomMessages: {},
       syncingPlatform: null,
+      bridgeConnections: {},
 
       login: async (homeserver, username, password) => {
         const { client, userId, accessToken } = await loginWithPassword(
@@ -219,6 +222,9 @@ export const useStore = create<AppState>()(
       },
 
       setReplyTo: (msg) => set({ replyTo: msg }),
+
+      setBridgeConnected: (platformId, connected) =>
+        set(s => ({ bridgeConnections: { ...s.bridgeConnections, [platformId]: connected } })),
 
       appendMessage: (msg) => {
         set(s => ({ messages: [...s.messages, msg] }))

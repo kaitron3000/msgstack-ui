@@ -46,7 +46,7 @@ export async function restoreClient(
 }
 
 export async function startSync(client: MatrixClient): Promise<void> {
-  await client.startClient({ initialSyncLimit: 20, lazyLoadMembers: true })
+  await client.startClient({ initialSyncLimit: 50, lazyLoadMembers: true })
   return new Promise(resolve => {
     client.once('sync', (state: string) => {
       if (state === 'PREPARED') resolve()

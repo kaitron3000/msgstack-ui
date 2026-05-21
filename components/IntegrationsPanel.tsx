@@ -1,5 +1,5 @@
 'use client'
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { X, ArrowLeft, ExternalLink, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react'
 import { useStore } from '@/lib/store'
 import { PLATFORMS } from '@/lib/platforms'
@@ -20,53 +20,37 @@ const ERRORS  = ['failed', 'error', 'bad-request', 'invalid', 'try again', 'unkn
 function isSuccess(t: string) { return SUCCESS.some(k => t.toLowerCase().includes(k)) }
 function isError(t: string)   { return ERRORS.some(k => t.toLowerCase().includes(k)) && !isSuccess(t) }
 
-/** Wait until the bot user has joined the room (max 15s) */
+/**
+ * Wait until the bot has fully JOINED the room (not just been invited).
+ * Only resolves on membership === 'join'. Max 20s.
+ */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function waitForBotJoin(client: any, roomId: string, botUserId: string): Promise<boolean> {
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i < 40; i++) {
     const room = client.getRoom(roomId)
     if (room) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const member = room.getMember(botUserId)
-      if (member && (member.membership === 'join' || member.membership === 'invite')) return true
+      // Must be 'join', not 'invite' — bot hasn't processed the invite yet otherwise
+      if (member?.membership === 'join') {
+        console.log(`[bridges] Bot ${botUserId} joined room ${roomId}`)
+        return true
+      }
     }
     await new Promise(r => setTimeout(r, 500))
   }
+  console.warn(`[bridges] Timed out waiting for ${botUserId} to join ${roomId}`)
   return false
 }
 
-/** Detect connection status by checking if rooms with this bot exist */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function detectConnected(client: any, botUserId: string, userId: string): boolean {
-  // Check management room for a recent success message
-  const mgmt = findManagementRoom(client, botUserId)
-  if (!mgmt) return false
-  const events = mgmt.getLiveTimeline().getEvents()
-  for (let i = events.length - 1; i >= 0; i--) {
-    const ev = events[i]
-    if (ev.getSender() !== botUserId) continue
-    if (ev.getType() !== 'm.room.message') continue
-    const body: string = (ev.getContent()?.body ?? '').toLowerCase()
-    if (isSuccess(body)) return true
-    if (body.includes('not logged') || body.includes('logged out') || body.includes('disconnected')) return false
-  }
-  // Fallback: any bridged rooms for this platform?
-  const rooms = client.getRooms()
-  return rooms.some((r: any) => {
-    if (r.getMyMembership() !== 'join') return false
-    const members = r.getMembers().map((m: any) => m.userId)
-    return members.includes(botUserId) && members.includes(userId) && members.length > 2
-  })
-}
-
-// ── QR image from mxc:// URL ───────────────────────────────────────────────
+// ── QR from mxc:// URL ─────────────────────────────────────────────────────
 
 function MxcQR({ mxcUrl, homeserver, token }: { mxcUrl: string; homeserver: string; token: string }) {
   const src = mxcToHttp(mxcUrl, homeserver, token)
   return (
     <div className="rounded-2xl bg-white p-3 shadow-lg">
       {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src={src} alt="QR" className="w-52 h-52 object-contain" onError={e => (e.currentTarget.style.display = 'none')} />
+      <img src={src} alt="QR" className="w-52 h-52 object-contain"
+        onError={e => (e.currentTarget.style.display = 'none')} />
     </div>
   )
 }
@@ -76,265 +60,18 @@ function MxcQR({ mxcUrl, homeserver, token }: { mxcUrl: string; homeserver: stri
 function UrlQR({ url }: { url: string }) {
   const [src, setSrc] = useState('')
   useEffect(() => {
-    import('qrcode').then(Q => Q.toDataURL(url, { width: 208, margin: 1 }).then(setSrc).catch(() => {}))
+    import('qrcode').then(Q =>
+      Q.toDataURL(url, { width: 208, margin: 1 }).then(setSrc).catch(() => {})
+    )
   }, [url])
   return src
     ? <div className="rounded-2xl bg-white p-3 shadow-lg"><img src={src} alt="QR" className="w-52 h-52" /></div>
-    : <div className="w-52 h-52 rounded-2xl bg-[#2b2d31] flex items-center justify-center"><Loader2 size={24} className="animate-spin text-[#5865f2]" /></div>
+    : <div className="w-52 h-52 rounded-2xl bg-[#2b2d31] flex items-center justify-center">
+        <Loader2 size={24} className="animate-spin text-[#5865f2]" />
+      </div>
 }
 
-// ── Generic hook: listen to bot messages in a room ─────────────────────────
-
-type BotHandler = (body: string | null, mxcUrl: string | null, type: string) => void
-
-function useBotMessages(roomId: string, botUserId: string, onMessage: BotHandler) {
-  const { client } = useStore()
-  useEffect(() => {
-    if (!client || !roomId) return
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    function handler(event: any, room: any) {
-      if (room?.roomId !== roomId) return
-      if (event.getSender() !== botUserId) return
-      if (event.getType() !== 'm.room.message') return
-      const content = event.getContent()
-      const mxc = content.msgtype === 'm.image' ? (content.url ?? null) : null
-      onMessage(content.body ?? null, mxc, content.msgtype ?? 'm.text')
-    }
-    client.on('Room.timeline', handler)
-    return () => client.removeListener('Room.timeline', handler)
-  }, [client, roomId, botUserId, onMessage])
-}
-
-// ── WhatsApp ───────────────────────────────────────────────────────────────
-
-function WhatsAppLogin({ onDone, onError }: { onDone: () => void; onError: (e: string) => void }) {
-  const { client, homeserver, accessToken } = useStore()
-  const p = PLATFORMS.find(pl => pl.id === 'whatsapp')!
-  const [qrMxc, setQrMxc] = useState('')
-  const [phase, setPhase] = useState<'starting' | 'qr' | 'done'>('starting')
-  const [roomId, setRoomId] = useState('')
-
-  useBotMessages(roomId, p.botUserId, useCallback((body, mxc) => {
-    if (mxc) { setQrMxc(mxc); setPhase('qr'); return }
-    if (body) {
-      if (isSuccess(body)) { setPhase('done'); setTimeout(onDone, 1500) }
-      if (isError(body)) onError(body)
-    }
-  }, [onDone, onError]))
-
-  useEffect(() => {
-    if (!client) return
-    async function start() {
-      const rid = await getOrCreateManagementRoom(client, p.botUserId)
-      setRoomId(rid)
-      await waitForBotJoin(client, rid, p.botUserId)
-      await client.sendTextMessage(rid, 'login')
-    }
-    start().catch(e => onError(e.message))
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  if (phase === 'done') return <SuccessView name="WhatsApp" />
-  if (phase === 'starting') return <SpinnerView color={p.color} label="Starting login…" />
-
-  return (
-    <div className="flex flex-col items-center gap-5 py-4">
-      <p className="font-bold text-white text-lg">Scan with WhatsApp</p>
-      <ol className="text-sm text-[#949ba4] space-y-1 w-full list-decimal list-inside">
-        <li>Open WhatsApp on your phone</li>
-        <li>Tap <strong className="text-white">Settings → Linked Devices</strong></li>
-        <li>Tap <strong className="text-white">Link a Device</strong> and scan below</li>
-      </ol>
-      {qrMxc
-        ? <MxcQR mxcUrl={qrMxc} homeserver={homeserver} token={accessToken} />
-        : <SpinnerView color={p.color} label="Generating QR code…" />
-      }
-      <WaitingLabel />
-    </div>
-  )
-}
-
-// ── Telegram ───────────────────────────────────────────────────────────────
-
-function TelegramLogin({ onDone, onError }: { onDone: () => void; onError: (e: string) => void }) {
-  const { client } = useStore()
-  const p = PLATFORMS.find(pl => pl.id === 'telegram')!
-  const [phase, setPhase] = useState<'phone' | 'sending' | 'code' | 'done'>('phone')
-  const [phone, setPhone] = useState('')
-  const [code, setCode] = useState('')
-  const [roomId, setRoomId] = useState('')
-  const [codeHint, setCodeHint] = useState('Check your Telegram app for the code')
-
-  useBotMessages(roomId, p.botUserId, useCallback((body) => {
-    if (!body) return
-    if (isSuccess(body)) { setPhase('done'); setTimeout(onDone, 1500); return }
-    if (isError(body)) { onError(body); return }
-    const b = body.toLowerCase()
-    if (b.includes('code') || b.includes('verification') || b.includes('otp')) {
-      setCodeHint(body); setPhase('code')
-    }
-  }, [onDone, onError]))
-
-  async function submitPhone() {
-    if (!phone.trim() || !client) return
-    setPhase('sending')
-    const rid = await getOrCreateManagementRoom(client, p.botUserId)
-    setRoomId(rid)
-    await waitForBotJoin(client, rid, p.botUserId)
-    await client.sendTextMessage(rid, 'login phone')
-    await new Promise(r => setTimeout(r, 1000))
-    await client.sendTextMessage(rid, phone.trim())
-  }
-
-  async function submitCode() {
-    if (!code.trim() || !roomId || !client) return
-    await client.sendTextMessage(roomId, code.trim())
-    setCode('')
-  }
-
-  if (phase === 'done') return <SuccessView name="Telegram" />
-  if (phase === 'sending') return <SpinnerView color={PLATFORMS.find(p => p.id === 'telegram')!.color} label="Sending code…" />
-
-  return (
-    <div className="flex flex-col gap-5 py-4 w-full">
-      {phase === 'phone' && (
-        <>
-          <div className="text-center">
-            <p className="font-bold text-white text-lg mb-1">Your phone number</p>
-            <p className="text-sm text-[#949ba4]">We'll send a code via Telegram</p>
-          </div>
-          <input type="tel" placeholder="+1 234 567 8900" value={phone}
-            onChange={e => setPhone(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && submitPhone()}
-            autoFocus
-            className="w-full bg-[#1e1f22] border border-white/10 rounded-xl px-4 py-3 text-white placeholder-[#6d6f78] text-center text-lg tracking-widest outline-none focus:border-[#26A5E4]" />
-          <button onClick={submitPhone} disabled={!phone.trim()}
-            className="w-full bg-[#26A5E4] hover:bg-[#1a94d3] disabled:opacity-40 text-white font-bold py-3 rounded-xl transition-colors">
-            Send Code
-          </button>
-        </>
-      )}
-      {phase === 'code' && (
-        <>
-          <div className="text-center">
-            <p className="font-bold text-white text-lg mb-1">Enter verification code</p>
-            <p className="text-sm text-[#949ba4]">{codeHint}</p>
-          </div>
-          <input type="text" placeholder="12345" value={code}
-            onChange={e => setCode(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && submitCode()}
-            autoFocus
-            className="w-full bg-[#1e1f22] border border-white/10 rounded-xl px-4 py-3 text-white placeholder-[#6d6f78] text-center text-2xl tracking-[0.5em] outline-none focus:border-[#26A5E4]" />
-          <button onClick={submitCode} disabled={!code.trim()}
-            className="w-full bg-[#26A5E4] hover:bg-[#1a94d3] disabled:opacity-40 text-white font-bold py-3 rounded-xl transition-colors">
-            Verify
-          </button>
-          <button onClick={() => setPhase('phone')} className="text-sm text-[#949ba4] hover:text-white transition-colors text-center">
-            ← Use different number
-          </button>
-        </>
-      )}
-    </div>
-  )
-}
-
-// ── Signal ─────────────────────────────────────────────────────────────────
-
-function SignalLogin({ onDone, onError }: { onDone: () => void; onError: (e: string) => void }) {
-  const { client } = useStore()
-  const p = PLATFORMS.find(pl => pl.id === 'signal')!
-  const [deepUrl, setDeepUrl] = useState('')
-  const [phase, setPhase] = useState<'starting' | 'qr' | 'done'>('starting')
-  const [roomId, setRoomId] = useState('')
-
-  useBotMessages(roomId, p.botUserId, useCallback((body) => {
-    if (!body) return
-    if (isSuccess(body)) { setPhase('done'); setTimeout(onDone, 1500); return }
-    if (isError(body)) { onError(body); return }
-    const url = extractUrl(body)
-    if (url?.startsWith('sgnl://')) { setDeepUrl(url); setPhase('qr') }
-  }, [onDone, onError]))
-
-  useEffect(() => {
-    if (!client) return
-    async function start() {
-      const rid = await getOrCreateManagementRoom(client, p.botUserId)
-      setRoomId(rid)
-      await waitForBotJoin(client, rid, p.botUserId)
-      await client.sendTextMessage(rid, 'login')
-    }
-    start().catch(e => onError(e.message))
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  if (phase === 'done') return <SuccessView name="Signal" />
-  if (phase === 'starting' && !deepUrl) return <SpinnerView color={p.color} label="Generating link code…" />
-
-  return (
-    <div className="flex flex-col items-center gap-5 py-4">
-      <p className="font-bold text-white text-lg">Link Signal Device</p>
-      <ol className="text-sm text-[#949ba4] space-y-1 w-full list-decimal list-inside">
-        <li>Open Signal on your phone</li>
-        <li>Tap your profile → <strong className="text-white">Linked Devices</strong></li>
-        <li>Tap <strong className="text-white">+</strong> and scan below</li>
-      </ol>
-      {deepUrl ? <UrlQR url={deepUrl} /> : <SpinnerView color={p.color} label="Generating QR…" />}
-      {deepUrl && (
-        <a href={deepUrl} className="flex items-center gap-2 text-sm text-[#3A76F0] hover:underline">
-          Open in Signal app <ExternalLink size={13} />
-        </a>
-      )}
-      <WaitingLabel />
-    </div>
-  )
-}
-
-// ── Discord ────────────────────────────────────────────────────────────────
-
-function DiscordLogin({ onDone, onError }: { onDone: () => void; onError: (e: string) => void }) {
-  const { client } = useStore()
-  const p = PLATFORMS.find(pl => pl.id === 'discord')!
-  const [oauthUrl, setOauthUrl] = useState('')
-  const [phase, setPhase] = useState<'starting' | 'oauth' | 'done'>('starting')
-  const [roomId, setRoomId] = useState('')
-
-  useBotMessages(roomId, p.botUserId, useCallback((body) => {
-    if (!body) return
-    if (isSuccess(body)) { setPhase('done'); setTimeout(onDone, 1500); return }
-    if (isError(body)) { onError(body); return }
-    const url = extractUrl(body)
-    if (url?.startsWith('http')) { setOauthUrl(url); setPhase('oauth') }
-  }, [onDone, onError]))
-
-  useEffect(() => {
-    if (!client) return
-    async function start() {
-      const rid = await getOrCreateManagementRoom(client, p.botUserId)
-      setRoomId(rid)
-      await waitForBotJoin(client, rid, p.botUserId)
-      await client.sendTextMessage(rid, 'login')
-    }
-    start().catch(e => onError(e.message))
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  if (phase === 'done') return <SuccessView name="Discord" />
-  if (phase === 'starting') return <SpinnerView color={p.color} label="Generating login link…" />
-
-  return (
-    <div className="flex flex-col items-center gap-5 py-4 text-center">
-      <p className="font-bold text-white text-lg">Authorize Discord</p>
-      <p className="text-sm text-[#949ba4]">Click below, log into Discord, then return here.</p>
-      <a href={oauthUrl} target="_blank" rel="noopener noreferrer"
-        className="flex items-center justify-center gap-2 w-full bg-[#5865F2] hover:bg-[#4752c4] text-white font-bold py-3 rounded-xl transition-colors">
-        Open Discord Login <ExternalLink size={16} />
-      </a>
-      <WaitingLabel />
-    </div>
-  )
-}
-
-// ── Shared UI bits ─────────────────────────────────────────────────────────
+// ── Shared UI ──────────────────────────────────────────────────────────────
 
 function SuccessView({ name }: { name: string }) {
   return (
@@ -359,6 +96,331 @@ function WaitingLabel() {
   return (
     <div className="flex items-center gap-2 text-xs text-[#949ba4]">
       <Loader2 size={12} className="animate-spin" /> Waiting…
+    </div>
+  )
+}
+
+// ── WhatsApp Login ─────────────────────────────────────────────────────────
+
+function WhatsAppLogin({ onDone, onError }: { onDone: () => void; onError: (e: string) => void }) {
+  const { client, homeserver, accessToken } = useStore()
+  const p = PLATFORMS.find(pl => pl.id === 'whatsapp')!
+  const [qrMxc, setQrMxc] = useState('')
+  const [phase, setPhase] = useState<'starting' | 'qr' | 'done'>('starting')
+  // Refs so the listener closure always has fresh callbacks
+  const onDoneRef = useRef(onDone)
+  const onErrorRef = useRef(onError)
+  useEffect(() => { onDoneRef.current = onDone; onErrorRef.current = onError }, [onDone, onError])
+
+  useEffect(() => {
+    if (!client) return
+
+    // Bug 1 fix: attach listener BEFORE any async work so we never miss the response
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    function handleTimeline(event: any, room: any) {
+      if (event.getSender() !== p.botUserId) return
+      if (event.getType() !== 'm.room.message') return
+      const content = event.getContent()
+      console.log('[WhatsApp] Bot message received:', content.msgtype, content.body?.slice(0, 80))
+
+      if (content.msgtype === 'm.image' && content.url) {
+        console.log('[WhatsApp] QR code image received')
+        setQrMxc(content.url)
+        setPhase('qr')
+        return
+      }
+      const body: string = content.body ?? ''
+      if (isSuccess(body)) {
+        console.log('[WhatsApp] Login success')
+        setPhase('done')
+        setTimeout(() => onDoneRef.current(), 1500)
+        return
+      }
+      if (isError(body)) {
+        console.error('[WhatsApp] Login error:', body)
+        onErrorRef.current(body)
+      }
+    }
+
+    client.on('Room.timeline', handleTimeline)
+
+    async function start() {
+      console.log('[WhatsApp] Getting/creating management room')
+      const rid = await getOrCreateManagementRoom(client, p.botUserId)
+      console.log('[WhatsApp] Management room:', rid)
+
+      const joined = await waitForBotJoin(client, rid, p.botUserId)
+      if (!joined) { onErrorRef.current('Bridge bot did not join the room. Is it running?'); return }
+
+      console.log('[WhatsApp] Sending login command')
+      await client.sendTextMessage(rid, 'login')
+      console.log('[WhatsApp] Login command sent, waiting for QR…')
+    }
+
+    start().catch(e => { console.error('[WhatsApp] start() error:', e); onErrorRef.current(e.message) })
+    return () => client.removeListener('Room.timeline', handleTimeline)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  if (phase === 'done') return <SuccessView name="WhatsApp" />
+  if (phase === 'starting' && !qrMxc) return <SpinnerView color={p.color} label="Starting login…" />
+
+  return (
+    <div className="flex flex-col items-center gap-5 py-4">
+      <p className="font-bold text-white text-lg">Scan with WhatsApp</p>
+      <ol className="text-sm text-[#949ba4] space-y-1 w-full list-decimal list-inside">
+        <li>Open WhatsApp on your phone</li>
+        <li>Tap <strong className="text-white">Settings → Linked Devices</strong></li>
+        <li>Tap <strong className="text-white">Link a Device</strong> and scan below</li>
+      </ol>
+      {qrMxc
+        ? <MxcQR mxcUrl={qrMxc} homeserver={homeserver} token={accessToken} />
+        : <SpinnerView color={p.color} label="Generating QR code…" />}
+      <WaitingLabel />
+    </div>
+  )
+}
+
+// ── Telegram Login ─────────────────────────────────────────────────────────
+
+function TelegramLogin({ onDone, onError }: { onDone: () => void; onError: (e: string) => void }) {
+  const { client } = useStore()
+  const p = PLATFORMS.find(pl => pl.id === 'telegram')!
+  const [phase, setPhase] = useState<'phone' | 'sending' | 'code' | 'done'>('phone')
+  const [phone, setPhone] = useState('')
+  const [code, setCode] = useState('')
+  const [roomId, setRoomId] = useState('')
+  const [codeHint, setCodeHint] = useState('Check your Telegram app for the code')
+  const onDoneRef = useRef(onDone)
+  const onErrorRef = useRef(onError)
+  useEffect(() => { onDoneRef.current = onDone; onErrorRef.current = onError }, [onDone, onError])
+
+  // Listener is registered when roomId is set — Telegram is interactive so we
+  // attach after the phone submit (when we know the room). This is safe because
+  // the bot won't respond until we send the phone number.
+  useEffect(() => {
+    if (!client || !roomId) return
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    function handleTimeline(event: any, room: any) {
+      if (room?.roomId !== roomId) return
+      if (event.getSender() !== p.botUserId) return
+      if (event.getType() !== 'm.room.message') return
+      const body: string = event.getContent()?.body ?? ''
+      console.log('[Telegram] Bot message:', body.slice(0, 80))
+
+      if (isSuccess(body)) { console.log('[Telegram] Login success'); setPhase('done'); setTimeout(() => onDoneRef.current(), 1500); return }
+      if (isError(body)) { console.error('[Telegram] Error:', body); onErrorRef.current(body); return }
+      const b = body.toLowerCase()
+      if (b.includes('code') || b.includes('verification') || b.includes('otp')) {
+        console.log('[Telegram] Code prompt received')
+        setCodeHint(body)
+        setPhase('code')
+      }
+    }
+    client.on('Room.timeline', handleTimeline)
+    return () => client.removeListener('Room.timeline', handleTimeline)
+  }, [client, roomId, p.botUserId])
+
+  async function submitPhone() {
+    if (!phone.trim() || !client) return
+    setPhase('sending')
+    try {
+      console.log('[Telegram] Getting/creating management room')
+      const rid = await getOrCreateManagementRoom(client, p.botUserId)
+      setRoomId(rid)
+      console.log('[Telegram] Management room:', rid)
+
+      const joined = await waitForBotJoin(client, rid, p.botUserId)
+      if (!joined) { onErrorRef.current('Bridge bot did not join. Is it running?'); return }
+
+      console.log('[Telegram] Sending login phone command')
+      await client.sendTextMessage(rid, 'login phone')
+      await new Promise(r => setTimeout(r, 800))
+      console.log('[Telegram] Sending phone number:', phone.trim())
+      await client.sendTextMessage(rid, phone.trim())
+      setPhase('code')
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Unknown error'
+      console.error('[Telegram] submitPhone error:', msg)
+      onErrorRef.current(msg)
+    }
+  }
+
+  async function submitCode() {
+    if (!code.trim() || !roomId || !client) return
+    console.log('[Telegram] Sending verification code')
+    await client.sendTextMessage(roomId, code.trim())
+    setCode('')
+  }
+
+  if (phase === 'done') return <SuccessView name="Telegram" />
+  if (phase === 'sending') return <SpinnerView color={p.color} label="Sending code…" />
+
+  return (
+    <div className="flex flex-col gap-5 py-4 w-full">
+      {phase === 'phone' && (
+        <>
+          <div className="text-center">
+            <p className="font-bold text-white text-lg mb-1">Your phone number</p>
+            <p className="text-sm text-[#949ba4]">We'll send a code via Telegram</p>
+          </div>
+          <input type="tel" placeholder="+1 234 567 8900" value={phone}
+            onChange={e => setPhone(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && submitPhone()} autoFocus
+            className="w-full bg-[#1e1f22] border border-white/10 rounded-xl px-4 py-3 text-white placeholder-[#6d6f78] text-center text-lg tracking-widest outline-none focus:border-[#26A5E4]" />
+          <button onClick={submitPhone} disabled={!phone.trim()}
+            className="w-full bg-[#26A5E4] hover:bg-[#1a94d3] disabled:opacity-40 text-white font-bold py-3 rounded-xl transition-colors">
+            Send Code
+          </button>
+        </>
+      )}
+      {phase === 'code' && (
+        <>
+          <div className="text-center">
+            <p className="font-bold text-white text-lg mb-1">Verification code</p>
+            <p className="text-sm text-[#949ba4]">{codeHint}</p>
+          </div>
+          <input type="text" placeholder="12345" value={code}
+            onChange={e => setCode(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && submitCode()} autoFocus
+            className="w-full bg-[#1e1f22] border border-white/10 rounded-xl px-4 py-3 text-white placeholder-[#6d6f78] text-center text-2xl tracking-[0.5em] outline-none focus:border-[#26A5E4]" />
+          <button onClick={submitCode} disabled={!code.trim()}
+            className="w-full bg-[#26A5E4] hover:bg-[#1a94d3] disabled:opacity-40 text-white font-bold py-3 rounded-xl transition-colors">
+            Verify
+          </button>
+          <button onClick={() => setPhase('phone')} className="text-sm text-[#949ba4] hover:text-white transition-colors text-center">
+            ← Use different number
+          </button>
+        </>
+      )}
+    </div>
+  )
+}
+
+// ── Signal Login ───────────────────────────────────────────────────────────
+
+function SignalLogin({ onDone, onError }: { onDone: () => void; onError: (e: string) => void }) {
+  const { client } = useStore()
+  const p = PLATFORMS.find(pl => pl.id === 'signal')!
+  const [deepUrl, setDeepUrl] = useState('')
+  const [phase, setPhase] = useState<'starting' | 'qr' | 'done'>('starting')
+  const onDoneRef = useRef(onDone)
+  const onErrorRef = useRef(onError)
+  useEffect(() => { onDoneRef.current = onDone; onErrorRef.current = onError }, [onDone, onError])
+
+  useEffect(() => {
+    if (!client) return
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    function handleTimeline(event: any) {
+      if (event.getSender() !== p.botUserId) return
+      if (event.getType() !== 'm.room.message') return
+      const body: string = event.getContent()?.body ?? ''
+      console.log('[Signal] Bot message:', body.slice(0, 80))
+
+      if (isSuccess(body)) { setPhase('done'); setTimeout(() => onDoneRef.current(), 1500); return }
+      if (isError(body)) { onErrorRef.current(body); return }
+      const url = extractUrl(body)
+      if (url?.startsWith('sgnl://')) {
+        console.log('[Signal] Deep link received')
+        setDeepUrl(url)
+        setPhase('qr')
+      }
+    }
+    client.on('Room.timeline', handleTimeline)
+    async function start() {
+      console.log('[Signal] Getting/creating management room')
+      const rid = await getOrCreateManagementRoom(client, p.botUserId)
+      console.log('[Signal] Management room:', rid)
+      const joined = await waitForBotJoin(client, rid, p.botUserId)
+      if (!joined) { onErrorRef.current('Bridge bot did not join. Is it running?'); return }
+      console.log('[Signal] Sending login command')
+      await client.sendTextMessage(rid, 'login')
+      console.log('[Signal] Login command sent, waiting for deep link…')
+    }
+    start().catch(e => { console.error('[Signal] start() error:', e); onErrorRef.current(e.message) })
+    return () => client.removeListener('Room.timeline', handleTimeline)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  if (phase === 'done') return <SuccessView name="Signal" />
+  if (phase === 'starting') return <SpinnerView color={p.color} label="Generating link code…" />
+
+  return (
+    <div className="flex flex-col items-center gap-5 py-4">
+      <p className="font-bold text-white text-lg">Link Signal Device</p>
+      <ol className="text-sm text-[#949ba4] space-y-1 w-full list-decimal list-inside">
+        <li>Open Signal on your phone</li>
+        <li>Tap your profile → <strong className="text-white">Linked Devices</strong></li>
+        <li>Tap <strong className="text-white">+</strong> and scan below</li>
+      </ol>
+      {deepUrl ? <UrlQR url={deepUrl} /> : <SpinnerView color={p.color} label="Generating QR…" />}
+      {deepUrl && (
+        <a href={deepUrl} className="flex items-center gap-2 text-sm text-[#3A76F0] hover:underline">
+          Open in Signal app <ExternalLink size={13} />
+        </a>
+      )}
+      <WaitingLabel />
+    </div>
+  )
+}
+
+// ── Discord Login ──────────────────────────────────────────────────────────
+
+function DiscordLogin({ onDone, onError }: { onDone: () => void; onError: (e: string) => void }) {
+  const { client } = useStore()
+  const p = PLATFORMS.find(pl => pl.id === 'discord')!
+  const [oauthUrl, setOauthUrl] = useState('')
+  const [phase, setPhase] = useState<'starting' | 'oauth' | 'done'>('starting')
+  const onDoneRef = useRef(onDone)
+  const onErrorRef = useRef(onError)
+  useEffect(() => { onDoneRef.current = onDone; onErrorRef.current = onError }, [onDone, onError])
+
+  useEffect(() => {
+    if (!client) return
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    function handleTimeline(event: any) {
+      if (event.getSender() !== p.botUserId) return
+      if (event.getType() !== 'm.room.message') return
+      const body: string = event.getContent()?.body ?? ''
+      console.log('[Discord] Bot message:', body.slice(0, 80))
+
+      if (isSuccess(body)) { setPhase('done'); setTimeout(() => onDoneRef.current(), 1500); return }
+      if (isError(body)) { onErrorRef.current(body); return }
+      const url = extractUrl(body)
+      if (url?.startsWith('http')) {
+        console.log('[Discord] OAuth URL received')
+        setOauthUrl(url)
+        setPhase('oauth')
+      }
+    }
+    client.on('Room.timeline', handleTimeline)
+    async function start() {
+      console.log('[Discord] Getting/creating management room')
+      const rid = await getOrCreateManagementRoom(client, p.botUserId)
+      console.log('[Discord] Management room:', rid)
+      const joined = await waitForBotJoin(client, rid, p.botUserId)
+      if (!joined) { onErrorRef.current('Bridge bot did not join. Is it running?'); return }
+      console.log('[Discord] Sending login command')
+      await client.sendTextMessage(rid, 'login')
+      console.log('[Discord] Login command sent, waiting for OAuth URL…')
+    }
+    start().catch(e => { console.error('[Discord] start() error:', e); onErrorRef.current(e.message) })
+    return () => client.removeListener('Room.timeline', handleTimeline)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  if (phase === 'done') return <SuccessView name="Discord" />
+  if (phase === 'starting') return <SpinnerView color={p.color} label="Generating login link…" />
+
+  return (
+    <div className="flex flex-col items-center gap-5 py-4 text-center">
+      <p className="font-bold text-white text-lg">Authorize Discord</p>
+      <p className="text-sm text-[#949ba4]">Click below, log into Discord, then return here.</p>
+      <a href={oauthUrl} target="_blank" rel="noopener noreferrer"
+        className="flex items-center justify-center gap-2 w-full bg-[#5865F2] hover:bg-[#4752c4] text-white font-bold py-3 rounded-xl transition-colors">
+        Open Discord Login <ExternalLink size={16} />
+      </a>
+      <WaitingLabel />
     </div>
   )
 }
@@ -425,11 +487,18 @@ function DisconnectScreen({ platformId, onBack, onDone }: {
     setBusy(true)
     try {
       const room = findManagementRoom(client, p.botUserId)
-      if (room) await client.sendTextMessage(room.roomId, 'logout')
-    } catch { /* ignore */ }
+      if (room) {
+        console.log(`[disconnect] Sending logout to ${p.botUserId} in room ${room.roomId}`)
+        await client.sendTextMessage(room.roomId, 'logout')
+      } else {
+        console.warn(`[disconnect] No management room found for ${p.botUserId}`)
+      }
+    } catch (e) {
+      console.error(`[disconnect] Error sending logout:`, e)
+    }
     setBusy(false)
     setDone(true)
-    setTimeout(onDone, 1000)
+    setTimeout(onDone, 800)
   }
 
   return (
@@ -440,7 +509,7 @@ function DisconnectScreen({ platformId, onBack, onDone }: {
       {done ? (
         <><CheckCircle2 size={40} className="text-green-400" /><p className="font-bold text-white">Disconnected</p></>
       ) : busy ? (
-        <><Loader2 size={32} className="animate-spin text-[#5865f2]" /></>
+        <Loader2 size={32} className="animate-spin text-[#5865f2]" />
       ) : (
         <>
           <div>
@@ -499,7 +568,7 @@ function PlatformRow({ platformId, connected, onConnect, onDisconnect }: {
   )
 }
 
-// ── Root ───────────────────────────────────────────────────────────────────
+// ── Root panel ─────────────────────────────────────────────────────────────
 
 type Screen =
   | { name: 'list' }
@@ -507,42 +576,23 @@ type Screen =
   | { name: 'disconnect'; platformId: PlatformId }
 
 export default function IntegrationsPanel({ onClose }: { onClose: () => void }) {
-  const { client, userId } = useStore()
+  const { userId, bridgeConnections, setBridgeConnected, syncPlatformMessages } = useStore()
   const shortId = userId.replace('@', '').split(':')[0]
-
-  // Track connected platforms locally so disconnect updates immediately
-  const [connected, setConnected] = useState<Record<PlatformId, boolean>>(() => {
-    const init = {} as Record<PlatformId, boolean>
-    PLATFORMS.forEach(p => { init[p.id as PlatformId] = false })
-    return init
-  })
   const [screen, setScreen] = useState<Screen>({ name: 'list' })
 
-  const refreshStatus = useCallback(() => {
-    if (!client) return
-    const next = {} as Record<PlatformId, boolean>
-    PLATFORMS.forEach(p => { next[p.id as PlatformId] = detectConnected(client, p.botUserId, userId) })
-    setConnected(next)
-  }, [client, userId])
-
-  useEffect(() => {
-    refreshStatus()
-    const t = setInterval(refreshStatus, 3000)
-    return () => clearInterval(t)
-  }, [refreshStatus])
-
-  function handleDisconnectDone(platformId: PlatformId) {
-    // Immediately mark as disconnected without waiting for polling
-    setConnected(prev => ({ ...prev, [platformId]: false }))
-    setScreen({ name: 'list' })
-  }
+  // Bug 2 fix: connection state lives in Zustand (bridgeConnections), not local React state.
+  // This means disconnect correctly survives polling cycles — once setBridgeConnected(id, false)
+  // is called, no polling re-derives and overwrites it.
 
   function handleLoginDone(platformId: PlatformId) {
-    setConnected(prev => ({ ...prev, [platformId]: true }))
+    setBridgeConnected(platformId, true)         // update Zustand immediately
     setScreen({ name: 'list' })
-    // Kick off background message sync for this platform
-    const { syncPlatformMessages } = useStore.getState()
-    syncPlatformMessages(platformId)
+    syncPlatformMessages(platformId)             // background room preload
+  }
+
+  function handleDisconnectDone(platformId: PlatformId) {
+    setBridgeConnected(platformId, false)        // update Zustand immediately — no polling overwrites
+    setScreen({ name: 'list' })
   }
 
   return (
@@ -571,7 +621,7 @@ export default function IntegrationsPanel({ onClose }: { onClose: () => void }) 
                 <PlatformRow
                   key={p.id}
                   platformId={p.id as PlatformId}
-                  connected={connected[p.id as PlatformId]}
+                  connected={bridgeConnections[p.id] ?? false}
                   onConnect={() => setScreen({ name: 'login', platformId: p.id as PlatformId })}
                   onDisconnect={() => setScreen({ name: 'disconnect', platformId: p.id as PlatformId })}
                 />

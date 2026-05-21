@@ -34,14 +34,31 @@ export async function getOrCreateManagementRoom(
   botUserId: string
 ): Promise<string> {
   const existing = findManagementRoom(client, botUserId)
-  if (existing) return existing.roomId
+  if (existing) {
+    console.log(`[bridges] Found existing management room for ${botUserId}:`, existing.roomId)
+    return existing.roomId
+  }
 
+  console.log(`[bridges] Creating new DM room for ${botUserId}`)
   const res = await client.createRoom({
     invite: [botUserId],
     is_direct: true,
     preset: 'trusted_private_chat',
   })
-  return res.room_id
+  const roomId: string = res.room_id
+  console.log(`[bridges] Created room ${roomId}, marking as m.direct`)
+
+  // Mark as DM in account data so the SDK tracks it correctly
+  try {
+    const directData = client.getAccountData('m.direct')
+    const direct: Record<string, string[]> = directData?.getContent() ?? {}
+    direct[botUserId] = [...(direct[botUserId] ?? []), roomId]
+    await client.setAccountData('m.direct', direct)
+  } catch (e) {
+    console.warn('[bridges] Could not set m.direct account data:', e)
+  }
+
+  return roomId
 }
 
 /** Detect connection status from management room messages */
