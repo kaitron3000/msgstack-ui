@@ -1,5 +1,5 @@
 'use client'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { ChevronDown, ChevronRight, Hash, Pencil, Settings, PlugZap } from 'lucide-react'
 import { useStore } from '@/lib/store'
 import { PLATFORMS, getPlatform } from '@/lib/platforms'
@@ -79,13 +79,22 @@ export default function ChatList() {
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null)
   const [showIntegrations, setShowIntegrations] = useState(false)
 
+  useEffect(() => {
+    const total = rooms.reduce((s, r) => s + r.unreadCount, 0)
+    document.title = total > 0 ? `(${total}) msgstack` : 'msgstack'
+  }, [rooms])
+
   const platform = PLATFORMS.find(p => p.id === selectedNav)
   const currentGroup = groups.find(g => g.id === selectedNav)
   const isEditing = editingGroupId === selectedNav && !!currentGroup
 
   let allRooms: AppRoom[]
   if (selectedNav === 'all') {
-    allRooms = [...rooms].sort((a, b) => b.lastMessageTs - a.lastMessageTs)
+    allRooms = [...rooms].sort((a, b) => {
+      if (a.unreadCount > 0 && b.unreadCount === 0) return -1
+      if (a.unreadCount === 0 && b.unreadCount > 0) return 1
+      return b.lastMessageTs - a.lastMessageTs
+    })
   } else if (platform) {
     allRooms = rooms.filter(r => r.platform === selectedNav)
   } else if (currentGroup) {

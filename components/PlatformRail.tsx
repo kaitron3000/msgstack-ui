@@ -16,10 +16,10 @@ function Pill({ active }: { active: boolean }) {
 }
 
 function ServerBtn({
-  id, label, color, active, unread, onClick, children,
+  id, label, color, active, unread, connected, onClick, children,
 }: {
   id: NavId; label: string; color: string; active: boolean
-  unread?: number; onClick: () => void; children: React.ReactNode
+  unread?: number; connected?: boolean; onClick: () => void; children: React.ReactNode
 }) {
   const [hovered, setHovered] = useState(false)
   const rounded = active || hovered ? '15px' : '50%'
@@ -51,6 +51,8 @@ function ServerBtn({
         <div className="absolute bottom-0 right-0 min-w-[18px] h-[18px] bg-[#ed4245] rounded-full flex items-center justify-center text-[10px] font-extrabold text-white px-1 pointer-events-none border-2 border-[#1e1f22]">
           {unread > 99 ? '99+' : unread}
         </div>
+      ) : connected ? (
+        <div className="absolute bottom-0.5 right-0.5 w-3 h-3 bg-[#23a55a] rounded-full border-2 border-[#1e1f22] pointer-events-none" />
       ) : null}
     </div>
   )
@@ -65,7 +67,7 @@ function Divider() {
 }
 
 export default function PlatformRail() {
-  const { selectedNav, selectNav, rooms, groups, deleteGroup, syncingPlatform } = useStore()
+  const { selectedNav, selectNav, rooms, groups, deleteGroup, syncingPlatform, bridgeConnections } = useStore()
   const [showGroupModal, setShowGroupModal] = useState(false)
   const [ctxMenu, setCtxMenu] = useState<{ group: Group; x: number; y: number } | null>(null)
 
@@ -86,7 +88,7 @@ export default function PlatformRail() {
         <Divider />
 
         {PLATFORMS.map(p => (
-          <ServerBtn key={p.id} id={p.id} label={p.name} color={p.color} active={selectedNav === p.id} unread={platformUnread(p.id)} onClick={() => selectNav(p.id)}>
+          <ServerBtn key={p.id} id={p.id} label={p.name} color={p.color} active={selectedNav === p.id} unread={platformUnread(p.id)} connected={bridgeConnections[p.id]} onClick={() => selectNav(p.id)}>
             {syncingPlatform === p.id ? (
               <Loader2 size={22} className="animate-spin" />
             ) : (

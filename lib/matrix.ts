@@ -1,5 +1,7 @@
 import type { AppRoom, AppMessage, PlatformId } from '@/types'
-import { detectPlatform } from './platforms'
+import { detectPlatform, PLATFORMS } from './platforms'
+
+const BOT_USER_IDS = new Set(PLATFORMS.map(p => p.botUserId))
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type MatrixClient = any
@@ -88,11 +90,16 @@ export function getAppRooms(client: MatrixClient, userId: string): AppRoom[] {
   return client
     .getRooms()
     .filter((r: MatrixRoom) => {
-      // Skip spaces and rooms we've left
       const membership = r.getMyMembership()
       if (membership !== 'join') return false
       const isSpace = r.isSpaceRoom?.() ?? false
-      return !isSpace
+      if (isSpace) return false
+      // Filter out bot management rooms (1:1 DMs with bridge bots)
+      const joinedIds: string[] = r.getMembers()
+        .filter((m: MatrixRoom) => m.membership === 'join')
+        .map((m: MatrixRoom) => m.userId)
+      if (joinedIds.length <= 3 && joinedIds.some(id => BOT_USER_IDS.has(id))) return false
+      return true
     })
     .map((r: MatrixRoom) => roomToAppRoom(r, userId))
     .sort((a: AppRoom, b: AppRoom) => b.lastMessageTs - a.lastMessageTs)
